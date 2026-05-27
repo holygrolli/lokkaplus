@@ -246,6 +246,177 @@ server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs
         };
     }
 });
+// Read-only tool — GET requests only, safe to auto-approve
+server.tool("Lokka-Microsoft-readonly", "A read-only tool to query Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management using GET requests only. Safe to grant auto-approve permissions. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\"'.", {
+    apiType: z.enum(["graph", "azure"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management."),
+    path: z.string().describe("The Azure or Graph API URL path to call (e.g. '/users', '/groups', '/subscriptions')"),
+    apiVersion: z.string().optional().describe("Azure Resource Management API version (required for apiType Azure)"),
+    subscriptionId: z.string().optional().describe("Azure Subscription ID (for Azure Resource Management)."),
+    queryParams: z.record(z.string()).optional().describe("Query parameters for the request"),
+    graphApiVersion: z.enum(["v1.0", "beta"]).optional().default(defaultGraphApiVersion).describe(`Microsoft Graph API version to use (default: ${defaultGraphApiVersion})`),
+    fetchAll: z.boolean().optional().default(false).describe("Set to true to automatically fetch all pages for list results (e.g., users, groups). Default is false."),
+    consistencyLevel: z.string().optional().describe("Graph API ConsistencyLevel header. ADVISED to be set to 'eventual' for Graph GET requests using advanced query parameters ($filter, $count, $search, $orderby)."),
+}, async ({ apiType, path, apiVersion, subscriptionId, queryParams, graphApiVersion, fetchAll, consistencyLevel }) => {
+    const effectiveGraphApiVersion = !useGraphBeta ? "v1.0" : graphApiVersion;
+    logger.info(`Executing Lokka-Microsoft-readonly tool with params: apiType=${apiType}, path=${path}, graphApiVersion=${effectiveGraphApiVersion}, fetchAll=${fetchAll}, consistencyLevel=${consistencyLevel}`);
+    let determinedUrl;
+    try {
+        let responseData;
+        if (apiType === 'graph') {
+            if (!graphClient) {
+                throw new Error("Graph client not initialized");
+            }
+            determinedUrl = `https://graph.microsoft.com/${effectiveGraphApiVersion}`;
+            let request = graphClient.api(path).version(effectiveGraphApiVersion);
+            if (queryParams && Object.keys(queryParams).length > 0) {
+                request = request.query(queryParams);
+            }
+            if (consistencyLevel) {
+                request = request.header('ConsistencyLevel', consistencyLevel);
+                logger.info(`Added ConsistencyLevel header: ${consistencyLevel}`);
+            }
+            if (fetchAll) {
+                logger.info(`Fetching all pages for Graph path: ${path}`);
+                const firstPageResponse = await request.get();
+                const odataContext = firstPageResponse['@odata.context'];
+                let allItems = firstPageResponse.value || [];
+                const callback = (item) => {
+                    allItems.push(item);
+                    return true;
+                };
+                const pageIterator = new PageIterator(graphClient, firstPageResponse, callback);
+                await pageIterator.iterate();
+                responseData = {
+                    '@odata.context': odataContext,
+                    value: allItems
+                };
+                logger.info(`Finished fetching all Graph pages. Total items: ${allItems.length}`);
+            }
+            else {
+                logger.info(`Fetching single page for Graph path: ${path}`);
+                responseData = await request.get();
+            }
+        }
+        else { // apiType === 'azure'
+            if (!authManager) {
+                throw new Error("Auth manager not initialized");
+            }
+            determinedUrl = "https://management.azure.com";
+            const azureCredential = authManager.getAzureCredential();
+            const tokenResponse = await azureCredential.getToken("https://management.azure.com/.default");
+            if (!tokenResponse || !tokenResponse.token) {
+                throw new Error("Failed to acquire Azure access token");
+            }
+            let url = determinedUrl;
+            if (subscriptionId) {
+                url += `/subscriptions/${subscriptionId}`;
+            }
+            url += path;
+            if (!apiVersion) {
+                throw new Error("API version is required for Azure Resource Management queries");
+            }
+            const urlParams = new URLSearchParams({ 'api-version': apiVersion });
+            if (queryParams) {
+                for (const [key, value] of Object.entries(queryParams)) {
+                    urlParams.append(String(key), String(value));
+                }
+            }
+            url += `?${urlParams.toString()}`;
+            const headers = {
+                'Authorization': `Bearer ${tokenResponse.token}`,
+                'Content-Type': 'application/json'
+            };
+            if (fetchAll) {
+                logger.info(`Fetching all pages for Azure RM starting from: ${url}`);
+                let allValues = [];
+                let currentUrl = url;
+                while (currentUrl) {
+                    logger.info(`Fetching Azure RM page: ${currentUrl}`);
+                    const azureCredential = authManager.getAzureCredential();
+                    const currentPageTokenResponse = await azureCredential.getToken("https://management.azure.com/.default");
+                    if (!currentPageTokenResponse || !currentPageTokenResponse.token) {
+                        throw new Error("Failed to acquire Azure access token during pagination");
+                    }
+                    const currentPageHeaders = { ...headers, 'Authorization': `Bearer ${currentPageTokenResponse.token}` };
+                    const pageResponse = await fetch(currentUrl, { method: 'GET', headers: currentPageHeaders });
+                    const pageText = await pageResponse.text();
+                    let pageData;
+                    try {
+                        pageData = pageText ? JSON.parse(pageText) : {};
+                    }
+                    catch (e) {
+                        logger.error(`Failed to parse JSON from Azure RM page: ${currentUrl}`, pageText);
+                        pageData = { rawResponse: pageText };
+                    }
+                    if (!pageResponse.ok) {
+                        logger.error(`API error on Azure RM page ${currentUrl}:`, pageData);
+                        throw new Error(`API error (${pageResponse.status}) during Azure RM pagination on ${currentUrl}: ${JSON.stringify(pageData)}`);
+                    }
+                    if (pageData.value && Array.isArray(pageData.value)) {
+                        allValues = allValues.concat(pageData.value);
+                    }
+                    else if (currentUrl === url && !pageData.nextLink) {
+                        allValues.push(pageData);
+                    }
+                    else if (currentUrl !== url) {
+                        logger.info(`[Warning] Azure RM response from ${currentUrl} did not contain a 'value' array.`);
+                    }
+                    currentUrl = pageData.nextLink || null;
+                }
+                responseData = { allValues: allValues };
+                logger.info(`Finished fetching all Azure RM pages. Total items: ${allValues.length}`);
+            }
+            else {
+                logger.info(`Fetching single page for Azure RM: ${url}`);
+                const apiResponse = await fetch(url, { method: 'GET', headers });
+                const responseText = await apiResponse.text();
+                try {
+                    responseData = responseText ? JSON.parse(responseText) : {};
+                }
+                catch (e) {
+                    logger.error(`Failed to parse JSON from single Azure RM page: ${url}`, responseText);
+                    responseData = { rawResponse: responseText };
+                }
+                if (!apiResponse.ok) {
+                    logger.error(`API error for Azure RM GET ${path}:`, responseData);
+                    throw new Error(`API error (${apiResponse.status}) for Azure RM: ${JSON.stringify(responseData)}`);
+                }
+            }
+        }
+        let resultText = `Result for ${apiType} API (${apiType === 'graph' ? effectiveGraphApiVersion : apiVersion}) - GET ${path}:\n\n`;
+        resultText += JSON.stringify(responseData, null, 2);
+        if (!fetchAll) {
+            const nextLinkKey = apiType === 'graph' ? '@odata.nextLink' : 'nextLink';
+            if (responseData && responseData[nextLinkKey]) {
+                resultText += `\n\nNote: More results are available. To retrieve all pages, add the parameter 'fetchAll: true' to your request.`;
+            }
+        }
+        return {
+            content: [{ type: "text", text: resultText }],
+        };
+    }
+    catch (error) {
+        logger.error(`Error in Lokka-Microsoft-readonly tool (apiType: ${apiType}, path: ${path}):`, error);
+        if (!determinedUrl) {
+            determinedUrl = apiType === 'graph'
+                ? `https://graph.microsoft.com/${effectiveGraphApiVersion}`
+                : "https://management.azure.com";
+        }
+        const errorBody = error.body ? (typeof error.body === 'string' ? error.body : JSON.stringify(error.body)) : 'N/A';
+        return {
+            content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        error: error instanceof Error ? error.message : String(error),
+                        statusCode: error.statusCode || 'N/A',
+                        errorBody: errorBody,
+                        attemptedBaseUrl: determinedUrl
+                    }),
+                }],
+            isError: true
+        };
+    }
+});
 // Add token management tools
 server.tool("set-access-token", "Set or update the access token for Microsoft Graph authentication. Use this when the MCP Client has obtained a fresh token through interactive authentication.", {
     accessToken: z.string().describe("The access token obtained from Microsoft Graph authentication"),

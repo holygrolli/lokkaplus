@@ -187,14 +187,27 @@ See the docs for more information on how to install and configure Lokka.
      - `body` (JSON): The request body (for POST, PUT, PATCH)
    - Returns: Results from the Azure or Graph API call.
 
-2. `set-access-token` *(New in v0.2.0)*
+2. `Lokka-Microsoft-readonly`
+   - Read-only variant of `Lokka-Microsoft` that only performs GET requests. Safe to grant auto-approve permissions in MCP clients that support tool-level approval policies.
+   - Input:
+     - `apiType` (string): Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management.
+     - `path` (string): The Azure or Graph API URL path to call (e.g. '/users', '/groups', '/subscriptions').
+     - `apiVersion` (string): Azure Resource Management API version (required for apiType Azure)
+     - `subscriptionId` (string): Azure Subscription ID (for Azure Resource Management).
+     - `queryParams` (string): Array of query parameters like $filter, $select, etc. All parameters are strings.
+     - `graphApiVersion` (string): Microsoft Graph API version to use (`v1.0` or `beta`, default depends on `USE_GRAPH_BETA`).
+     - `fetchAll` (boolean): Set to `true` to automatically fetch all pages for list results. Default: `false`.
+     - `consistencyLevel` (string): Graph API ConsistencyLevel header. Advised to be `'eventual'` for requests using `$filter`, `$count`, `$search`, or `$orderby`.
+   - Returns: Results from the Azure or Graph API GET call.
+
+3. `set-access-token` *(New in v0.2.0)*
    - Set or update an access token for Microsoft Graph authentication when using client-provided token mode.
    - Input:
      - `accessToken` (string): The access token obtained from Microsoft Graph authentication
      - `expiresOn` (string, optional): Token expiration time in ISO format
    - Returns: Confirmation of token update
 
-3. `get-auth-status` *(New in v0.2.0)*
+4. `get-auth-status` *(New in v0.2.0)*
    - Check the current authentication status and mode of the MCP Server
    - Returns: Authentication mode, readiness status, and capabilities
 
@@ -258,3 +271,75 @@ To use this server with the Claude Desktop app, add the following configuration 
 ```
 
 Make sure to replace `<tenant-id>`, `<client-id>`, and `<client-secret>` with the actual values from your Microsoft Entra application. (See [Install Guide](https://lokka.dev/docs/install) for more details on how to create an Entra app and configure the agent.)
+
+## Running from a local build (without publishing to npm)
+
+If you are working with a fork of this repository and do not want to publish a new npm package, you can run the MCP server directly from the locally compiled JavaScript.
+
+### 1. Build the server
+
+```bash
+git clone https://github.com/<your-fork>/lokkaplus.git
+cd lokkaplus/src/mcp
+npm install
+npm run build
+```
+
+This produces the compiled output in `src/mcp/build/main.js`.
+
+### 2. Configure your MCP client to run the local build
+
+Instead of `npx @merill/lokka`, point the `command` to `node` and pass the absolute path to `build/main.js` as the argument.
+
+**Interactive authentication (simplest):**
+
+```json
+{
+  "mcpServers": {
+    "Lokka-Microsoft": {
+      "command": "node",
+      "args": ["/absolute/path/to/lokkaplus/src/mcp/build/main.js"]
+    }
+  }
+}
+```
+
+**Client credentials:**
+
+```json
+{
+  "mcpServers": {
+    "Lokka-Microsoft": {
+      "command": "node",
+      "args": ["/absolute/path/to/lokkaplus/src/mcp/build/main.js"],
+      "env": {
+        "TENANT_ID": "<tenant-id>",
+        "CLIENT_ID": "<client-id>",
+        "CLIENT_SECRET": "<client-secret>"
+      }
+    }
+  }
+}
+```
+
+All other environment variables (e.g. `USE_GRAPH_BETA`, `USE_INTERACTIVE`, `USE_CLIENT_TOKEN`) work exactly the same way as the published package.
+
+### 3. Using the read-only tool with auto-approve
+
+The `Lokka-Microsoft-readonly` tool is included in the same server binary. MCP clients that support per-tool approval policies (e.g. VS Code with GitHub Copilot, Claude Desktop with trust settings) can be configured to auto-approve `Lokka-Microsoft-readonly` while still requiring manual confirmation for the write-capable `Lokka-Microsoft` tool.
+
+Example VS Code `mcp.json` (`.vscode/mcp.json` or user settings) with a local build:
+
+```json
+{
+  "servers": {
+    "Lokka-Microsoft": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/absolute/path/to/lokkaplus/src/mcp/build/main.js"]
+    }
+  }
+}
+```
+
+After adding the server, use VS Code's **MCP: Configure Tool Approvals** (or the inline approval UI) to set `Lokka-Microsoft-readonly` to auto-approve and keep `Lokka-Microsoft` on manual approval.

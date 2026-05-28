@@ -31,7 +31,7 @@ logger.info(`Graph API default version: ${defaultGraphApiVersion} (USE_GRAPH_BET
 
 server.tool(
   "Lokka-Microsoft",
-  "A versatile tool to interact with Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\"'.",
+  "A versatile tool to interact with Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\". NOTE: To retrieve inline image attachments from Teams channel or chat messages (URLs containing hostedContents), use the dedicated get-teams-hosted-content tool instead.",
   {
     apiType: z.enum(["graph", "azure"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management."),
     path: z.string().describe("The Azure or Graph API URL path to call (e.g. '/users', '/groups', '/subscriptions')"),
@@ -301,7 +301,7 @@ server.tool(
 // Read-only tool — GET requests only, safe to auto-approve
 server.tool(
   "Lokka-Microsoft-readonly",
-  "A read-only tool to query Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management using GET requests only. Safe to grant auto-approve permissions. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\"'.",
+  "A read-only tool to query Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management using GET requests only. Safe to grant auto-approve permissions. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\". NOTE: To retrieve inline image attachments from Teams channel or chat messages (URLs containing hostedContents), use the dedicated get-teams-hosted-content tool instead.",
   {
     apiType: z.enum(["graph", "azure"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management."),
     path: z.string().describe("The Azure or Graph API URL path to call (e.g. '/users', '/groups', '/subscriptions')"),
@@ -774,6 +774,111 @@ server.tool(
           text: `Error requesting additional permissions: ${error.message}` 
         }],
         isError: true
+      };
+    }
+  }
+);
+
+// Teams hosted content tool — fetches binary inline attachments (e.g. inline images) from
+// Teams channel or chat messages via the $value endpoint, which returns raw binary data.
+// The standard JSON metadata endpoint (without /$value) always returns contentBytes: null.
+server.tool(
+  "get-teams-hosted-content",
+  "Retrieve binary hosted content (e.g. inline images) from a Microsoft Teams channel or chat message. " +
+  "Use this when a message's body or attachments contain a URL with 'hostedContents' in it. " +
+  "Provide the hostedContents resource path (without '/$value'), e.g. " +
+  "'/teams/{team-id}/channels/{channel-id}/messages/{message-id}/hostedContents/{hosted-content-id}' or " +
+  "'/chats/{chat-id}/messages/{message-id}/hostedContents/{hosted-content-id}'. " +
+  "The tool appends '/$value' internally and returns the binary as an image (for image/* MIME types) or base64 text. " +
+  "Required Graph permissions: ChannelMessage.Read.All (channel) or Chat.Read / Chat.Read.All (chat). " +
+  "To list all hosted content IDs for a message use the Lokka-Microsoft-readonly tool with the hostedContents collection path.",
+  {
+    path: z.string().describe(
+      "The Graph API path to the hostedContents resource (without '/$value'), e.g. " +
+      "'/teams/{team-id}/channels/{channel-id}/messages/{message-id}/hostedContents/{hosted-content-id}'"
+    ),
+    graphApiVersion: z.enum(["v1.0", "beta"]).optional().default(defaultGraphApiVersion as "v1.0" | "beta").describe(
+      `Microsoft Graph API version to use (default: ${defaultGraphApiVersion})`
+    ),
+  },
+  async ({ path, graphApiVersion }: { path: string; graphApiVersion: "v1.0" | "beta" }) => {
+    const effectiveVersion = !useGraphBeta ? "v1.0" : graphApiVersion;
+    logger.info(`Executing get-teams-hosted-content tool: path=${path}, version=${effectiveVersion}`);
+
+    if (!authManager) {
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify({ error: "Auth manager not initialized" }) }],
+        isError: true,
+      };
+    }
+
+    try {
+      const token = await authManager.getGraphAuthProvider().getAccessToken();
+      const url = `https://graph.microsoft.com/${effectiveVersion}${path}/$value`;
+      logger.info(`Fetching hosted content binary from: ${url}`);
+
+      const response = await fetch(url, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.error(`Error fetching hosted content: ${response.status}`, errorText);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: `Graph API error (${response.status})`,
+              errorBody: errorText,
+              attemptedUrl: url,
+            }),
+          }],
+          isError: true,
+        };
+      }
+
+      const mimeType = (response.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
+      const buffer = await response.arrayBuffer();
+      const base64 = Buffer.from(buffer).toString("base64");
+
+      logger.info(`Successfully fetched hosted content: mimeType=${mimeType}, bytes=${buffer.byteLength}`);
+
+      if (mimeType.startsWith("image/")) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Hosted content fetched from ${path} (${mimeType}, ${buffer.byteLength} bytes):`,
+            },
+            {
+              type: "image" as const,
+              data: base64,
+              mimeType: mimeType,
+            },
+          ],
+        };
+      }
+
+      // Non-image binary: return base64 in text
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Hosted content fetched from ${path}\nMIME type: ${mimeType}\nSize: ${buffer.byteLength} bytes\nBase64-encoded content:\n${base64}`,
+        }],
+      };
+
+    } catch (error: any) {
+      logger.error("Error in get-teams-hosted-content tool:", error);
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            error: error instanceof Error ? error.message : String(error),
+            path,
+          }),
+        }],
+        isError: true,
       };
     }
   }

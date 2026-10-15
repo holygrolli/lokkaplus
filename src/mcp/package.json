@@ -27,6 +27,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "prepare": "npm run build",
     "build:unix": "tsc && chmod 755 build/main.js",
     "demo:token": "node build/demo-token-auth.js",
     "test:token": "node build/test-token-auth.js",

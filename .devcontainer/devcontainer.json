@@ -1,0 +1,31 @@
+{
+  "name": "Copilot Sandbox",
+	"image": "mcr.microsoft.com/devcontainers/base:noble",
+	"features": {
+		"ghcr.io/devcontainers-extra/features/mise:1": {}
+	},
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "github.copilot",
+        "github.copilot-chat",
+        "eamodio.gitlens",
+        "hediet.vscode-drawio",
+        "ms-vscode-remote.remote-containers"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh"
+      }
+    }
+  },
+
+  // "mounts": [
+  //   "source=${localEnv:HOME}/.ssh,target=/home/vscode/.ssh,readonly,type=bind",
+  //   "source=${localWorkspaceFolder}/.devcontainer/.aws,target=/home/vscode/.aws,type=bind"
+  // ],
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "remoteUser": "vscode"
+}
+

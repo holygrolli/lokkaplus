@@ -30,7 +30,7 @@ const defaultGraphApiVersion = getDefaultGraphApiVersion();
 logger.info(`Graph API default version: ${defaultGraphApiVersion} (USE_GRAPH_BETA=${process.env.USE_GRAPH_BETA || 'undefined'})`);
 
 server.tool(
-  "Lokka-Microsoft",
+  "lokkaplus",
   "A versatile tool to interact with Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\". NOTE: To retrieve inline image attachments from Teams channel or chat messages (URLs containing hostedContents), use the dedicated get-teams-hosted-content tool instead.",
   {
     apiType: z.enum(["graph", "azure"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management."),
@@ -300,7 +300,7 @@ server.tool(
 
 // Read-only tool — GET requests only, safe to auto-approve
 server.tool(
-  "Lokka-Microsoft-readonly",
+  "lokkaplus-readonly",
   "A read-only tool to query Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management using GET requests only. Safe to grant auto-approve permissions. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\". NOTE: To retrieve inline image attachments from Teams channel or chat messages (URLs containing hostedContents), use the dedicated get-teams-hosted-content tool instead.",
   {
     apiType: z.enum(["graph", "azure"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management."),
@@ -884,6 +884,146 @@ server.tool(
   }
 );
 
+// Download contentUrl tool — direct-download for SharePoint/OneDrive URLs from message attachments
+server.tool(
+  "download-content-url",
+  "Download a contentUrl (typically SharePoint/OneDrive URL from a message attachment) using the existing Graph Bearer token. Returns image binary (as image + base64) or base64 text with MIME metadata.",
+  {
+    contentUrl: z.string().describe("The full contentUrl from the message attachment (SharePoint/OneDrive URL)"),
+    graphApiVersion: z.enum(["v1.0", "beta"]).optional().default(defaultGraphApiVersion as "v1.0" | "beta").describe(`Microsoft Graph API version to use for potential fallback (not used by direct download)`),
+    preferGraphFallback: z.boolean().optional().default(false).describe("If true, attempt Graph-based fallback instead of direct fetch first"),
+  },
+  async ({ contentUrl, graphApiVersion, preferGraphFallback }: { contentUrl: string; graphApiVersion: "v1.0" | "beta"; preferGraphFallback?: boolean }) => {
+    logger.info(`Executing download-content-url for: ${contentUrl}`);
+
+    if (!authManager) {
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify({ error: "Auth manager not initialized" }) }],
+        isError: true,
+      };
+    }
+
+    try {
+      const token = await authManager.getGraphAuthProvider().getAccessToken();
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token}`,
+        Accept: "*/*",
+        "User-Agent": "Lokka-MCP-Server/0.2.0",
+      };
+
+      // Try direct fetch first unless preferGraphFallback is set
+      if (!preferGraphFallback) {
+        logger.info(`Attempting direct fetch of contentUrl: ${contentUrl}`);
+        const response = await fetch(contentUrl, { method: "GET", headers, redirect: 'follow' });
+
+        if (response.ok) {
+          const mimeType = (response.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
+          const buffer = await response.arrayBuffer();
+          const base64 = Buffer.from(buffer).toString("base64");
+
+          logger.info(`Downloaded contentUrl successfully: mimeType=${mimeType}, bytes=${buffer.byteLength}`);
+
+          if (mimeType.startsWith("image/")) {
+            return {
+              content: [
+                { type: "text" as const, text: `Content downloaded from contentUrl (${mimeType}, ${buffer.byteLength} bytes)` },
+                { type: "image" as const, data: base64, mimeType: mimeType },
+              ],
+            };
+          }
+
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Content downloaded from contentUrl\nMIME type: ${mimeType}\nSize: ${buffer.byteLength} bytes\nBase64-encoded content:\n${base64}`,
+            }],
+          };
+        }
+
+        // If direct fetch failed (including 401/403), attempt Graph Shares API fallback
+        const status = response.status;
+        const responseText = await response.text();
+        logger.info(`Direct fetch returned ${status}; attempting Graph Shares API fallback`);
+
+        // Prepare shares API encoded id (base64url)
+        const encodeShareId = (urlStr: string) => {
+          const b64 = Buffer.from(urlStr, 'utf8').toString('base64');
+          return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        };
+
+        try {
+          const encoded = encodeShareId(contentUrl);
+          const sharesPath = `/shares/u!${encoded}/driveItem/content`;
+          const sharesUrl = `https://graph.microsoft.com/${graphApiVersion}${sharesPath}`;
+          logger.info(`Attempting Graph shares endpoint: ${sharesUrl}`);
+
+          const sharesResp = await fetch(sharesUrl, { method: 'GET', headers: { Authorization: `Bearer ${token}` }, redirect: 'follow' });
+
+          if (sharesResp.ok) {
+            const mimeType = (sharesResp.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
+            const buf = await sharesResp.arrayBuffer();
+            const b64 = Buffer.from(buf).toString('base64');
+            logger.info(`Graph shares download succeeded: mimeType=${mimeType}, bytes=${buf.byteLength}`);
+            if (mimeType.startsWith('image/')) {
+              return {
+                content: [
+                  { type: "text" as const, text: `Content downloaded via Graph shares API (${mimeType}, ${buf.byteLength} bytes)` },
+                  { type: "image" as const, data: b64, mimeType: mimeType },
+                ],
+              };
+            }
+            return {
+              content: [{ type: "text" as const, text: `Content downloaded via Graph shares API\nMIME type: ${mimeType}\nSize: ${buf.byteLength} bytes\nBase64-encoded content:\n${b64}` }],
+            };
+          }
+
+          const sharesText = await sharesResp.text();
+          logger.error(`Graph shares API returned ${sharesResp.status}`, sharesText);
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({
+              error: `Direct fetch failed with HTTP ${status} and Graph shares fallback returned HTTP ${sharesResp.status}`,
+              directFetchBody: responseText,
+              sharesBody: sharesText,
+              attemptedSharesUrl: sharesUrl,
+              suggestion: "Ensure token has Sites.Read.All or Files.Read.All and that the resource is shareable via Graph shares API. You can request additional scopes or use set-access-token.",
+            }, null, 2) }],
+            isError: true,
+          };
+
+        } catch (err: any) {
+          logger.error("Error during Graph shares fallback", err);
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify({ error: `Direct fetch failed HTTP ${status}`, directBody: responseText, sharesFallbackError: err instanceof Error ? err.message : String(err) }, null, 2) }],
+            isError: true,
+          };
+        }
+      }
+
+      // If preferGraphFallback or direct fetch not desired, return diagnostic and hint for Graph fallback.
+      logger.info("Direct fetch skipped or not preferred; suggest Graph fallback or mapping to drive endpoint.");
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({
+            message: "Direct fetch skipped or not preferred. Consider using Graph Drive API fallback.",
+            note: "This tool implements direct download only. For a Graph-based fallback (mapping contentUrl to /sites/.../drive/items/.../content), enable preferGraphFallback=false and implement mapping logic.",
+            requiredScopes: ["Sites.Read.All", "Files.Read.All"],
+            contentUrl,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+
+    } catch (error: any) {
+      logger.error("Error in download-content-url tool:", error);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify({ error: error instanceof Error ? error.message : String(error), contentUrl }) }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // Start the server with stdio transport
 async function main() {
   // Determine authentication mode based on environment variables
@@ -974,8 +1114,15 @@ async function main() {
   };
 
   authManager = new AuthManager(authConfig);
-  
-  // Only initialize if we have required config (for client token mode, we can start without a token)
+
+  // Start MCP transport first so the initialize handshake with the host
+  // can complete immediately, before authentication (which may require
+  // interactive browser sign-in and can take tens of seconds).
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+
+  // Authenticate after MCP is connected. Tool handlers already guard against
+  // a null graphClient, so they return a clear error while auth is in progress.
   if (authMode !== AuthMode.ClientProvidedToken || initialAccessToken) {
     await authManager.initialize();
     
@@ -989,9 +1136,6 @@ async function main() {
   } else {
     logger.info("Started in client token mode. Use set-access-token tool to provide authentication token.");
   }
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
 }
 
 main().catch((error) => {

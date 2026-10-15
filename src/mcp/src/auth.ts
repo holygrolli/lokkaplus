@@ -1,5 +1,7 @@
-import { AccessToken, TokenCredential, ClientSecretCredential, ClientCertificateCredential, InteractiveBrowserCredential, DeviceCodeCredential, DeviceCodeInfo } from "@azure/identity";
+import { AccessToken, TokenCredential, ClientSecretCredential, ClientCertificateCredential, DeviceCodeCredential, DeviceCodeInfo } from "@azure/identity";
+import { PublicClientApplication, AccountInfo, ILoopbackClient, ServerAuthorizationCodeResponse } from "@azure/msal-node";
 import { AuthenticationProvider } from "@microsoft/microsoft-graph-client";
+import * as http from "http";
 import jwt from "jsonwebtoken";
 import { logger } from "./logger.js";
 import { LokkaClientId, LokkaDefaultTenantId, LokkaDefaultRedirectUri } from "./constants.js";
@@ -99,6 +101,166 @@ export class ClientProvidedTokenCredential implements TokenBasedCredential {
   }
 }
 
+/**
+ * Custom loopback client that listens on "::" (IPv6 dual-stack).
+ *
+ * On macOS, /etc/hosts maps `localhost` to ::1 (IPv6) first.
+ * @azure/msal-node's built-in LoopbackClient binds to 127.0.0.1 (IPv4 only),
+ * so browsers that connect via ::1 get "connection refused" and the auth
+ * callback is never delivered.  Binding to "::" accepts both IPv6 and IPv4
+ * connections (dual-stack), fixing this transparently.
+ */
+class DualStackLoopbackClient implements ILoopbackClient {
+  private server: http.Server | undefined;
+
+  async listenForAuthCode(
+    successTemplate?: string,
+    errorTemplate?: string,
+  ): Promise<ServerAuthorizationCodeResponse> {
+    if (this.server) {
+      throw new Error("Loopback server already exists");
+    }
+
+    this.server = http.createServer();
+
+    // Wait for the server to actually start listening before returning the
+    // outer promise so that getRedirectUri() is ready when MSAL polls it.
+    await new Promise<void>((resolve, reject) => {
+      this.server!.once("listening", resolve);
+      this.server!.once("error", reject);
+      this.server!.listen(0, "::"); // dual-stack: handles both ::1 (IPv6) and 127.0.0.1 (IPv4)
+    });
+
+    return new Promise<ServerAuthorizationCodeResponse>((resolve, reject) => {
+      this.server!.on("request", (req: http.IncomingMessage, res: http.ServerResponse) => {
+        const url = req.url;
+        if (!url) {
+          res.end(errorTemplate ?? "Error occurred loading redirect URL");
+          reject(new Error("Unable to load redirect URL"));
+          return;
+        }
+        if (url === "/") {
+          // Browser followed the 302 redirect after code delivery — show success page.
+          res.end(successTemplate ?? "Auth code was successfully acquired. You can close this window now.");
+          return;
+        }
+        const redirectUri = this.getRedirectUri();
+        const parsedUrl = new URL(url, redirectUri);
+        const params: Record<string, string> = {};
+        parsedUrl.searchParams.forEach((v, k) => { params[k] = v; });
+
+        if (params["code"]) {
+          // Redirect browser to "/" so the success page is shown.
+          res.writeHead(302, { location: redirectUri });
+          res.end();
+        }
+        if (params["error"]) {
+          res.end(errorTemplate ?? `Error: ${params["error"]}`);
+        }
+        resolve(params as ServerAuthorizationCodeResponse);
+      });
+    });
+  }
+
+  getRedirectUri(): string {
+    if (!this.server?.listening) {
+      // Throw a plain error; MSAL's waitForRedirectUri will reject if it's not
+      // the expected NodeAuthError, but by the time MSAL first polls (100 ms)
+      // the server will already be listening since we awaited the listen event.
+      throw new Error("Loopback server is not listening yet");
+    }
+    const address = this.server.address() as { port: number };
+    return `http://localhost:${address.port}`;
+  }
+
+  closeServer(): void {
+    if (this.server) {
+      this.server.close();
+      try { (this.server as any).closeAllConnections?.(); } catch { /* ignore */ }
+      this.server.unref();
+      this.server = undefined;
+    }
+  }
+}
+
+/**
+ * Interactive browser credential backed directly by @azure/msal-node.
+ *
+ * Fixes two issues present in @azure/identity's InteractiveBrowserCredential:
+ *   1. The built-in openBrowser uses `open(url, { wait: true })` which blocks
+ *      until the browser window is closed, so token exchange never happens.
+ *   2. The built-in LoopbackClient listens on 127.0.0.1 (IPv4) only, which
+ *      fails on systems where `localhost` resolves to ::1 (IPv6) first.
+ */
+class MsalInteractiveCredential implements TokenCredential {
+  private pca: PublicClientApplication;
+  private account: AccountInfo | null = null;
+  private tenantId: string;
+
+  constructor(tenantId: string, clientId: string) {
+    this.tenantId = tenantId;
+    this.pca = new PublicClientApplication({
+      auth: {
+        clientId,
+        authority: `https://login.microsoftonline.com/${tenantId}`,
+      },
+      system: {
+        loggerOptions: {
+          loggerCallback: () => { /* suppress MSAL verbose logs */ },
+          piiLoggingEnabled: false,
+          logLevel: 3, // Error
+        },
+      },
+    });
+  }
+
+  async getToken(scopes: string | string[]): Promise<AccessToken | null> {
+    const scopeArray = Array.isArray(scopes) ? scopes : [scopes];
+
+    // Try silent authentication with a cached account first.
+    if (this.account) {
+      try {
+        const silentResult = await this.pca.acquireTokenSilent({
+          scopes: scopeArray,
+          account: this.account,
+          forceRefresh: false,
+        });
+        if (silentResult?.accessToken) {
+          return {
+            token: silentResult.accessToken,
+            expiresOnTimestamp: silentResult.expiresOn?.getTime() ?? Date.now() + 3600_000,
+          };
+        }
+      } catch {
+        // Silent auth failed — fall through to interactive.
+      }
+    }
+
+    // Interactive auth: open browser (without wait:true) + dual-stack loopback.
+    const result = await this.pca.acquireTokenInteractive({
+      scopes: scopeArray,
+      loopbackClient: new DualStackLoopbackClient(),
+      openBrowser: async (url: string) => {
+        // Dynamic import of `open` (ESM-only package).
+        const { default: open } = await import("open");
+        // Do NOT use { wait: true } — that blocks until the browser process
+        // exits, delaying token exchange until the user closes the browser.
+        await open(url, { wait: false, newInstance: false });
+      },
+    });
+
+    if (!result?.accessToken) {
+      throw new Error("Interactive authentication did not return an access token");
+    }
+
+    this.account = result.account;
+    return {
+      token: result.accessToken,
+      expiresOnTimestamp: result.expiresOn?.getTime() ?? Date.now() + 3600_000,
+    };
+  }
+}
+
 export enum AuthMode {
   ClientCredentials = "client_credentials",
   ClientProvidedToken = "client_provided_token", 
@@ -166,35 +328,23 @@ export class AuthManager {
         
         logger.info(`Initializing Interactive authentication with tenant ID: ${tenantId}, client ID: ${clientId}`);
         
-        try {
-          // Try Interactive Browser first
-          this.credential = new InteractiveBrowserCredential({
-            tenantId: tenantId,
-            clientId: clientId,
-            redirectUri: this.config.redirectUri || LokkaDefaultRedirectUri,
-          });
-        } catch (error) {
-          // Fallback to Device Code flow
-          logger.info("Interactive browser failed, falling back to device code flow");
-          this.credential = new DeviceCodeCredential({
-            tenantId: tenantId,
-            clientId: clientId,
-            userPromptCallback: (info: DeviceCodeInfo) => {
-              console.log(`\n🔐 Authentication Required:`);
-              console.log(`Please visit: ${info.verificationUri}`);
-              console.log(`And enter code: ${info.userCode}\n`);
-              return Promise.resolve();
-            },
-          });
-        }
+        // Use MsalInteractiveCredential instead of @azure/identity's
+        // InteractiveBrowserCredential to avoid two known issues:
+        //   1. InteractiveBrowserCredential opens the browser with { wait: true },
+        //      blocking token exchange until the window is closed.
+        //   2. Its loopback server binds to 127.0.0.1 only, which fails when
+        //      the browser resolves `localhost` to ::1 (IPv6) first on macOS.
+        this.credential = new MsalInteractiveCredential(tenantId, clientId);
         break;
 
       default:
         throw new Error(`Unsupported authentication mode: ${this.config.mode}`);
     }
 
-    // Test the credential
-    await this.testCredential();
+    // Test the credential (skip interactive — auth is deferred to first tool call)
+    if (this.config.mode !== AuthMode.Interactive) {
+      await this.testCredential();
+    }
   }
 
   updateAccessToken(accessToken: string, expiresOn?: Date): void {

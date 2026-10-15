@@ -1,13 +1,48 @@
 import { AccessToken, TokenCredential, ClientSecretCredential, ClientCertificateCredential, DeviceCodeCredential, DeviceCodeInfo } from "@azure/identity";
-import { PublicClientApplication, AccountInfo, ILoopbackClient, ServerAuthorizationCodeResponse } from "@azure/msal-node";
+import { PublicClientApplication, AccountInfo, ICachePlugin, ILoopbackClient, ServerAuthorizationCodeResponse } from "@azure/msal-node";
+import { DataProtectionScope, PersistenceCachePlugin, PersistenceCreator } from "@azure/msal-node-extensions";
 import { AuthenticationProvider } from "@microsoft/microsoft-graph-client";
+import { mkdirSync } from "fs";
 import * as http from "http";
+import { homedir } from "os";
+import { dirname, join } from "path";
 import jwt from "jsonwebtoken";
 import { logger } from "./logger.js";
 import { LokkaClientId, LokkaDefaultTenantId, LokkaDefaultRedirectUri } from "./constants.js";
 
 // Constants
 const ONE_HOUR_IN_MS = 60 * 60 * 1000; // One hour in milliseconds
+const DEFAULT_TOKEN_CACHE_PATH = join(homedir(), ".lokkaplus", "msal-token-cache.json");
+const GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Creates an MSAL cache plugin that persists tokens (incl. refresh token) across
+ * server restarts, encrypted with the OS secret store (Windows DPAPI, macOS Keychain,
+ * Linux libsecret). Returns undefined (in-memory cache only) if disabled or unavailable.
+ */
+async function createTokenCachePlugin(): Promise<ICachePlugin | undefined> {
+  if (process.env.DISABLE_TOKEN_CACHE === "true") {
+    logger.info("Persistent token cache disabled via DISABLE_TOKEN_CACHE");
+    return undefined;
+  }
+
+  const cachePath = process.env.TOKEN_CACHE_PATH || DEFAULT_TOKEN_CACHE_PATH;
+  try {
+    mkdirSync(dirname(cachePath), { recursive: true, mode: 0o700 });
+    const persistence = await PersistenceCreator.createPersistence({
+      cachePath,
+      dataProtectionScope: DataProtectionScope.CurrentUser,
+      serviceName: "lokkaplus",
+      accountName: "msal-token-cache",
+      usePlaintextFileOnLinux: false,
+    });
+    logger.info(`Using persistent token cache at ${cachePath}`);
+    return new PersistenceCachePlugin(persistence);
+  } catch (error) {
+    logger.error("Persistent token cache unavailable, falling back to in-memory cache", error);
+    return undefined;
+  }
+}
 
 // Helper function to parse JWT and extract scopes
 function parseJwtScopes(token: string): string[] {
@@ -193,34 +228,60 @@ class DualStackLoopbackClient implements ILoopbackClient {
  *      fails on systems where `localhost` resolves to ::1 (IPv6) first.
  */
 class MsalInteractiveCredential implements TokenCredential {
-  private pca: PublicClientApplication;
+  private pcaPromise: Promise<PublicClientApplication> | null = null;
   private account: AccountInfo | null = null;
   private tenantId: string;
+  private clientId: string;
 
   constructor(tenantId: string, clientId: string) {
     this.tenantId = tenantId;
-    this.pca = new PublicClientApplication({
-      auth: {
-        clientId,
-        authority: `https://login.microsoftonline.com/${tenantId}`,
-      },
-      system: {
-        loggerOptions: {
-          loggerCallback: () => { /* suppress MSAL verbose logs */ },
-          piiLoggingEnabled: false,
-          logLevel: 3, // Error
+    this.clientId = clientId;
+  }
+
+  private getPca(): Promise<PublicClientApplication> {
+    if (!this.pcaPromise) {
+      this.pcaPromise = createTokenCachePlugin().then(cachePlugin => new PublicClientApplication({
+        auth: {
+          clientId: this.clientId,
+          authority: `https://login.microsoftonline.com/${this.tenantId}`,
         },
-      },
-    });
+        cache: cachePlugin ? { cachePlugin } : undefined,
+        system: {
+          loggerOptions: {
+            loggerCallback: () => { /* suppress MSAL verbose logs */ },
+            piiLoggingEnabled: false,
+            logLevel: 3, // Error
+          },
+        },
+      }));
+    }
+    return this.pcaPromise;
+  }
+
+  // Restores the signed-in account from the persistent cache after a server restart.
+  private async findCachedAccount(pca: PublicClientApplication): Promise<AccountInfo | null> {
+    const accounts = await pca.getTokenCache().getAllAccounts();
+    if (GUID_PATTERN.test(this.tenantId)) {
+      return accounts.find(a => a.tenantId?.toLowerCase() === this.tenantId.toLowerCase()) ?? null;
+    }
+    return accounts[0] ?? null;
   }
 
   async getToken(scopes: string | string[]): Promise<AccessToken | null> {
     const scopeArray = Array.isArray(scopes) ? scopes : [scopes];
+    const pca = await this.getPca();
 
-    // Try silent authentication with a cached account first.
+    if (!this.account) {
+      this.account = await this.findCachedAccount(pca);
+      if (this.account) {
+        logger.info(`Restored cached account ${this.account.username} from token cache`);
+      }
+    }
+
+    // Try silent authentication with a cached account first (uses refresh token if needed).
     if (this.account) {
       try {
-        const silentResult = await this.pca.acquireTokenSilent({
+        const silentResult = await pca.acquireTokenSilent({
           scopes: scopeArray,
           account: this.account,
           forceRefresh: false,
@@ -231,13 +292,13 @@ class MsalInteractiveCredential implements TokenCredential {
             expiresOnTimestamp: silentResult.expiresOn?.getTime() ?? Date.now() + 3600_000,
           };
         }
-      } catch {
-        // Silent auth failed — fall through to interactive.
+      } catch (error) {
+        logger.info("Silent token acquisition failed, falling back to interactive login", error instanceof Error ? error.message : error);
       }
     }
 
     // Interactive auth: open browser (without wait:true) + dual-stack loopback.
-    const result = await this.pca.acquireTokenInteractive({
+    const result = await pca.acquireTokenInteractive({
       scopes: scopeArray,
       loopbackClient: new DualStackLoopbackClient(),
       openBrowser: async (url: string) => {

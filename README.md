@@ -228,6 +228,14 @@ The configuration of the server is done using environment variables. The followi
 | `REDIRECT_URI` | Redirect URI for interactive authentication (default: `http://localhost:3000`). | No |
 | `ACCESS_TOKEN` | Initial access token for client-provided token mode. | No |
 | `USE_GRAPH_BETA` | Set to "false" to force all Graph API calls to use v1.0 instead of beta (default: true, allows beta). | No |
+| `TOKEN_CACHE_PATH` | Interactive mode: location of the persistent token cache (default: `~/.lokkaplus/msal-token-cache.json`). | No |
+| `DISABLE_TOKEN_CACHE` | Interactive mode: set to "true" to keep tokens in memory only (sign-in required after every restart). | No |
+
+### Persistent token cache (interactive mode)
+
+In interactive mode, Lokka stores the MSAL token cache (including the refresh token) encrypted with the operating system's secret store: Windows DPAPI, macOS Keychain, or Linux libsecret. After a restart of the MCP server, tokens are renewed silently, so the browser sign-in is only needed again when the refresh token expires or is revoked (by default after 90 days of inactivity, or earlier if Conditional Access sign-in frequency policies apply). If the secret store is unavailable, Lokka falls back to an in-memory cache.
+
+To sign out, delete the cache file and, on macOS, the Keychain entry: `security delete-generic-password -s lokkaplus -a msal-token-cache`.
 
 ## Contributors
 

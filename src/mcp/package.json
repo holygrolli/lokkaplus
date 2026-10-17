@@ -1,11 +1,11 @@
 {
-  "name": "@merill/lokka",
+  "name": "@holygrolli/lokkaplus",
   "version": "0.3.0",
-  "description": "Lokka is a Model Context Protocol (MCP) server for Microsoft Graph.",
+  "description": "Lokkaplus is a Model Context Protocol (MCP) server for Microsoft Graph with explicit read-only tooling",
   "license": "MIT",
   "author": "Merill",
-  "homepage": "https://lokka.dev",
-  "bugs": "https://github.com/merill/lokka/issues",
+  "homepage": "",
+  "bugs": "https://github.com/holygrolli/lokkaplus/issues",
   "main": "main.js",
   "type": "module",
   "keywords": [
@@ -19,11 +19,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/merill/lokka.git",
+    "url": "git+https://github.com/holygrolli/lokkaplus.git",
     "directory": "src/mcp"
   },
   "bin": {
-    "lokka": "build/main.js"
+    "lokkaplus": "build/main.js"
   },
   "scripts": {
     "build": "tsc",

@@ -22,7 +22,7 @@ let graphClient = null;
 const useGraphBeta = process.env.USE_GRAPH_BETA !== 'false'; // Default to true unless explicitly set to 'false'
 const defaultGraphApiVersion = getDefaultGraphApiVersion();
 logger.info(`Graph API default version: ${defaultGraphApiVersion} (USE_GRAPH_BETA=${process.env.USE_GRAPH_BETA || 'undefined'})`);
-server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\"'.", {
+server.tool("lokkaplus", "A versatile tool to interact with Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\". NOTE: To retrieve inline image attachments from Teams channel or chat messages (URLs containing hostedContents), use the dedicated get-teams-hosted-content tool instead.", {
     apiType: z.enum(["graph", "azure"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management."),
     path: z.string().describe("The Azure or Graph API URL path to call (e.g. '/users', '/groups', '/subscriptions')"),
     method: z.enum(["get", "post", "put", "patch", "delete"]).describe("HTTP method to use"),
@@ -238,6 +238,177 @@ server.tool("Lokka-Microsoft", "A versatile tool to interact with Microsoft APIs
                     text: JSON.stringify({
                         error: error instanceof Error ? error.message : String(error),
                         statusCode: error.statusCode || 'N/A', // Include status code if available from SDK error
+                        errorBody: errorBody,
+                        attemptedBaseUrl: determinedUrl
+                    }),
+                }],
+            isError: true
+        };
+    }
+});
+// Read-only tool — GET requests only, safe to auto-approve
+server.tool("lokkaplus-readonly", "A read-only tool to query Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management using GET requests only. Safe to grant auto-approve permissions. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\". NOTE: To retrieve inline image attachments from Teams channel or chat messages (URLs containing hostedContents), use the dedicated get-teams-hosted-content tool instead.", {
+    apiType: z.enum(["graph", "azure"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management."),
+    path: z.string().describe("The Azure or Graph API URL path to call (e.g. '/users', '/groups', '/subscriptions')"),
+    apiVersion: z.string().optional().describe("Azure Resource Management API version (required for apiType Azure)"),
+    subscriptionId: z.string().optional().describe("Azure Subscription ID (for Azure Resource Management)."),
+    queryParams: z.record(z.string()).optional().describe("Query parameters for the request"),
+    graphApiVersion: z.enum(["v1.0", "beta"]).optional().default(defaultGraphApiVersion).describe(`Microsoft Graph API version to use (default: ${defaultGraphApiVersion})`),
+    fetchAll: z.boolean().optional().default(false).describe("Set to true to automatically fetch all pages for list results (e.g., users, groups). Default is false."),
+    consistencyLevel: z.string().optional().describe("Graph API ConsistencyLevel header. ADVISED to be set to 'eventual' for Graph GET requests using advanced query parameters ($filter, $count, $search, $orderby)."),
+}, async ({ apiType, path, apiVersion, subscriptionId, queryParams, graphApiVersion, fetchAll, consistencyLevel }) => {
+    const effectiveGraphApiVersion = !useGraphBeta ? "v1.0" : graphApiVersion;
+    logger.info(`Executing Lokka-Microsoft-readonly tool with params: apiType=${apiType}, path=${path}, graphApiVersion=${effectiveGraphApiVersion}, fetchAll=${fetchAll}, consistencyLevel=${consistencyLevel}`);
+    let determinedUrl;
+    try {
+        let responseData;
+        if (apiType === 'graph') {
+            if (!graphClient) {
+                throw new Error("Graph client not initialized");
+            }
+            determinedUrl = `https://graph.microsoft.com/${effectiveGraphApiVersion}`;
+            let request = graphClient.api(path).version(effectiveGraphApiVersion);
+            if (queryParams && Object.keys(queryParams).length > 0) {
+                request = request.query(queryParams);
+            }
+            if (consistencyLevel) {
+                request = request.header('ConsistencyLevel', consistencyLevel);
+                logger.info(`Added ConsistencyLevel header: ${consistencyLevel}`);
+            }
+            if (fetchAll) {
+                logger.info(`Fetching all pages for Graph path: ${path}`);
+                const firstPageResponse = await request.get();
+                const odataContext = firstPageResponse['@odata.context'];
+                let allItems = firstPageResponse.value || [];
+                const callback = (item) => {
+                    allItems.push(item);
+                    return true;
+                };
+                const pageIterator = new PageIterator(graphClient, firstPageResponse, callback);
+                await pageIterator.iterate();
+                responseData = {
+                    '@odata.context': odataContext,
+                    value: allItems
+                };
+                logger.info(`Finished fetching all Graph pages. Total items: ${allItems.length}`);
+            }
+            else {
+                logger.info(`Fetching single page for Graph path: ${path}`);
+                responseData = await request.get();
+            }
+        }
+        else { // apiType === 'azure'
+            if (!authManager) {
+                throw new Error("Auth manager not initialized");
+            }
+            determinedUrl = "https://management.azure.com";
+            const azureCredential = authManager.getAzureCredential();
+            const tokenResponse = await azureCredential.getToken("https://management.azure.com/.default");
+            if (!tokenResponse || !tokenResponse.token) {
+                throw new Error("Failed to acquire Azure access token");
+            }
+            let url = determinedUrl;
+            if (subscriptionId) {
+                url += `/subscriptions/${subscriptionId}`;
+            }
+            url += path;
+            if (!apiVersion) {
+                throw new Error("API version is required for Azure Resource Management queries");
+            }
+            const urlParams = new URLSearchParams({ 'api-version': apiVersion });
+            if (queryParams) {
+                for (const [key, value] of Object.entries(queryParams)) {
+                    urlParams.append(String(key), String(value));
+                }
+            }
+            url += `?${urlParams.toString()}`;
+            const headers = {
+                'Authorization': `Bearer ${tokenResponse.token}`,
+                'Content-Type': 'application/json'
+            };
+            if (fetchAll) {
+                logger.info(`Fetching all pages for Azure RM starting from: ${url}`);
+                let allValues = [];
+                let currentUrl = url;
+                while (currentUrl) {
+                    logger.info(`Fetching Azure RM page: ${currentUrl}`);
+                    const azureCredential = authManager.getAzureCredential();
+                    const currentPageTokenResponse = await azureCredential.getToken("https://management.azure.com/.default");
+                    if (!currentPageTokenResponse || !currentPageTokenResponse.token) {
+                        throw new Error("Failed to acquire Azure access token during pagination");
+                    }
+                    const currentPageHeaders = { ...headers, 'Authorization': `Bearer ${currentPageTokenResponse.token}` };
+                    const pageResponse = await fetch(currentUrl, { method: 'GET', headers: currentPageHeaders });
+                    const pageText = await pageResponse.text();
+                    let pageData;
+                    try {
+                        pageData = pageText ? JSON.parse(pageText) : {};
+                    }
+                    catch (e) {
+                        logger.error(`Failed to parse JSON from Azure RM page: ${currentUrl}`, pageText);
+                        pageData = { rawResponse: pageText };
+                    }
+                    if (!pageResponse.ok) {
+                        logger.error(`API error on Azure RM page ${currentUrl}:`, pageData);
+                        throw new Error(`API error (${pageResponse.status}) during Azure RM pagination on ${currentUrl}: ${JSON.stringify(pageData)}`);
+                    }
+                    if (pageData.value && Array.isArray(pageData.value)) {
+                        allValues = allValues.concat(pageData.value);
+                    }
+                    else if (currentUrl === url && !pageData.nextLink) {
+                        allValues.push(pageData);
+                    }
+                    else if (currentUrl !== url) {
+                        logger.info(`[Warning] Azure RM response from ${currentUrl} did not contain a 'value' array.`);
+                    }
+                    currentUrl = pageData.nextLink || null;
+                }
+                responseData = { allValues: allValues };
+                logger.info(`Finished fetching all Azure RM pages. Total items: ${allValues.length}`);
+            }
+            else {
+                logger.info(`Fetching single page for Azure RM: ${url}`);
+                const apiResponse = await fetch(url, { method: 'GET', headers });
+                const responseText = await apiResponse.text();
+                try {
+                    responseData = responseText ? JSON.parse(responseText) : {};
+                }
+                catch (e) {
+                    logger.error(`Failed to parse JSON from single Azure RM page: ${url}`, responseText);
+                    responseData = { rawResponse: responseText };
+                }
+                if (!apiResponse.ok) {
+                    logger.error(`API error for Azure RM GET ${path}:`, responseData);
+                    throw new Error(`API error (${apiResponse.status}) for Azure RM: ${JSON.stringify(responseData)}`);
+                }
+            }
+        }
+        let resultText = `Result for ${apiType} API (${apiType === 'graph' ? effectiveGraphApiVersion : apiVersion}) - GET ${path}:\n\n`;
+        resultText += JSON.stringify(responseData, null, 2);
+        if (!fetchAll) {
+            const nextLinkKey = apiType === 'graph' ? '@odata.nextLink' : 'nextLink';
+            if (responseData && responseData[nextLinkKey]) {
+                resultText += `\n\nNote: More results are available. To retrieve all pages, add the parameter 'fetchAll: true' to your request.`;
+            }
+        }
+        return {
+            content: [{ type: "text", text: resultText }],
+        };
+    }
+    catch (error) {
+        logger.error(`Error in Lokka-Microsoft-readonly tool (apiType: ${apiType}, path: ${path}):`, error);
+        if (!determinedUrl) {
+            determinedUrl = apiType === 'graph'
+                ? `https://graph.microsoft.com/${effectiveGraphApiVersion}`
+                : "https://management.azure.com";
+        }
+        const errorBody = error.body ? (typeof error.body === 'string' ? error.body : JSON.stringify(error.body)) : 'N/A';
+        return {
+            content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        error: error instanceof Error ? error.message : String(error),
+                        statusCode: error.statusCode || 'N/A',
                         errorBody: errorBody,
                         attemptedBaseUrl: determinedUrl
                     }),
@@ -477,6 +648,213 @@ server.tool("add-graph-permission", "Request additional Microsoft Graph permissi
         };
     }
 });
+// Teams hosted content tool — fetches binary inline attachments (e.g. inline images) from
+// Teams channel or chat messages via the $value endpoint, which returns raw binary data.
+// The standard JSON metadata endpoint (without /$value) always returns contentBytes: null.
+server.tool("get-teams-hosted-content", "Retrieve binary hosted content (e.g. inline images) from a Microsoft Teams channel or chat message. " +
+    "Use this when a message's body or attachments contain a URL with 'hostedContents' in it. " +
+    "Provide the hostedContents resource path (without '/$value'), e.g. " +
+    "'/teams/{team-id}/channels/{channel-id}/messages/{message-id}/hostedContents/{hosted-content-id}' or " +
+    "'/chats/{chat-id}/messages/{message-id}/hostedContents/{hosted-content-id}'. " +
+    "The tool appends '/$value' internally and returns the binary as an image (for image/* MIME types) or base64 text. " +
+    "Required Graph permissions: ChannelMessage.Read.All (channel) or Chat.Read / Chat.Read.All (chat). " +
+    "To list all hosted content IDs for a message use the Lokka-Microsoft-readonly tool with the hostedContents collection path.", {
+    path: z.string().describe("The Graph API path to the hostedContents resource (without '/$value'), e.g. " +
+        "'/teams/{team-id}/channels/{channel-id}/messages/{message-id}/hostedContents/{hosted-content-id}'"),
+    graphApiVersion: z.enum(["v1.0", "beta"]).optional().default(defaultGraphApiVersion).describe(`Microsoft Graph API version to use (default: ${defaultGraphApiVersion})`),
+}, async ({ path, graphApiVersion }) => {
+    const effectiveVersion = !useGraphBeta ? "v1.0" : graphApiVersion;
+    logger.info(`Executing get-teams-hosted-content tool: path=${path}, version=${effectiveVersion}`);
+    if (!authManager) {
+        return {
+            content: [{ type: "text", text: JSON.stringify({ error: "Auth manager not initialized" }) }],
+            isError: true,
+        };
+    }
+    try {
+        const token = await authManager.getGraphAuthProvider().getAccessToken();
+        const url = `https://graph.microsoft.com/${effectiveVersion}${path}/$value`;
+        logger.info(`Fetching hosted content binary from: ${url}`);
+        const response = await fetch(url, {
+            method: "GET",
+            headers: { Authorization: `Bearer ${token}` },
+        });
+        if (!response.ok) {
+            const errorText = await response.text();
+            logger.error(`Error fetching hosted content: ${response.status}`, errorText);
+            return {
+                content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            error: `Graph API error (${response.status})`,
+                            errorBody: errorText,
+                            attemptedUrl: url,
+                        }),
+                    }],
+                isError: true,
+            };
+        }
+        const mimeType = (response.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
+        const buffer = await response.arrayBuffer();
+        const base64 = Buffer.from(buffer).toString("base64");
+        logger.info(`Successfully fetched hosted content: mimeType=${mimeType}, bytes=${buffer.byteLength}`);
+        if (mimeType.startsWith("image/")) {
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Hosted content fetched from ${path} (${mimeType}, ${buffer.byteLength} bytes):`,
+                    },
+                    {
+                        type: "image",
+                        data: base64,
+                        mimeType: mimeType,
+                    },
+                ],
+            };
+        }
+        // Non-image binary: return base64 in text
+        return {
+            content: [{
+                    type: "text",
+                    text: `Hosted content fetched from ${path}\nMIME type: ${mimeType}\nSize: ${buffer.byteLength} bytes\nBase64-encoded content:\n${base64}`,
+                }],
+        };
+    }
+    catch (error) {
+        logger.error("Error in get-teams-hosted-content tool:", error);
+        return {
+            content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        error: error instanceof Error ? error.message : String(error),
+                        path,
+                    }),
+                }],
+            isError: true,
+        };
+    }
+});
+// Download contentUrl tool — direct-download for SharePoint/OneDrive URLs from message attachments
+server.tool("download-content-url", "Download a contentUrl (typically SharePoint/OneDrive URL from a message attachment) using the existing Graph Bearer token. Returns image binary (as image + base64) or base64 text with MIME metadata.", {
+    contentUrl: z.string().describe("The full contentUrl from the message attachment (SharePoint/OneDrive URL)"),
+    graphApiVersion: z.enum(["v1.0", "beta"]).optional().default(defaultGraphApiVersion).describe(`Microsoft Graph API version to use for potential fallback (not used by direct download)`),
+    preferGraphFallback: z.boolean().optional().default(false).describe("If true, attempt Graph-based fallback instead of direct fetch first"),
+}, async ({ contentUrl, graphApiVersion, preferGraphFallback }) => {
+    logger.info(`Executing download-content-url for: ${contentUrl}`);
+    if (!authManager) {
+        return {
+            content: [{ type: "text", text: JSON.stringify({ error: "Auth manager not initialized" }) }],
+            isError: true,
+        };
+    }
+    try {
+        const token = await authManager.getGraphAuthProvider().getAccessToken();
+        const headers = {
+            Authorization: `Bearer ${token}`,
+            Accept: "*/*",
+            "User-Agent": "Lokka-MCP-Server/0.2.0",
+        };
+        // Try direct fetch first unless preferGraphFallback is set
+        if (!preferGraphFallback) {
+            logger.info(`Attempting direct fetch of contentUrl: ${contentUrl}`);
+            const response = await fetch(contentUrl, { method: "GET", headers, redirect: 'follow' });
+            if (response.ok) {
+                const mimeType = (response.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
+                const buffer = await response.arrayBuffer();
+                const base64 = Buffer.from(buffer).toString("base64");
+                logger.info(`Downloaded contentUrl successfully: mimeType=${mimeType}, bytes=${buffer.byteLength}`);
+                if (mimeType.startsWith("image/")) {
+                    return {
+                        content: [
+                            { type: "text", text: `Content downloaded from contentUrl (${mimeType}, ${buffer.byteLength} bytes)` },
+                            { type: "image", data: base64, mimeType: mimeType },
+                        ],
+                    };
+                }
+                return {
+                    content: [{
+                            type: "text",
+                            text: `Content downloaded from contentUrl\nMIME type: ${mimeType}\nSize: ${buffer.byteLength} bytes\nBase64-encoded content:\n${base64}`,
+                        }],
+                };
+            }
+            // If direct fetch failed (including 401/403), attempt Graph Shares API fallback
+            const status = response.status;
+            const responseText = await response.text();
+            logger.info(`Direct fetch returned ${status}; attempting Graph Shares API fallback`);
+            // Prepare shares API encoded id (base64url)
+            const encodeShareId = (urlStr) => {
+                const b64 = Buffer.from(urlStr, 'utf8').toString('base64');
+                return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+            };
+            try {
+                const encoded = encodeShareId(contentUrl);
+                const sharesPath = `/shares/u!${encoded}/driveItem/content`;
+                const sharesUrl = `https://graph.microsoft.com/${graphApiVersion}${sharesPath}`;
+                logger.info(`Attempting Graph shares endpoint: ${sharesUrl}`);
+                const sharesResp = await fetch(sharesUrl, { method: 'GET', headers: { Authorization: `Bearer ${token}` }, redirect: 'follow' });
+                if (sharesResp.ok) {
+                    const mimeType = (sharesResp.headers.get("content-type") || "application/octet-stream").split(";")[0].trim();
+                    const buf = await sharesResp.arrayBuffer();
+                    const b64 = Buffer.from(buf).toString('base64');
+                    logger.info(`Graph shares download succeeded: mimeType=${mimeType}, bytes=${buf.byteLength}`);
+                    if (mimeType.startsWith('image/')) {
+                        return {
+                            content: [
+                                { type: "text", text: `Content downloaded via Graph shares API (${mimeType}, ${buf.byteLength} bytes)` },
+                                { type: "image", data: b64, mimeType: mimeType },
+                            ],
+                        };
+                    }
+                    return {
+                        content: [{ type: "text", text: `Content downloaded via Graph shares API\nMIME type: ${mimeType}\nSize: ${buf.byteLength} bytes\nBase64-encoded content:\n${b64}` }],
+                    };
+                }
+                const sharesText = await sharesResp.text();
+                logger.error(`Graph shares API returned ${sharesResp.status}`, sharesText);
+                return {
+                    content: [{ type: "text", text: JSON.stringify({
+                                error: `Direct fetch failed with HTTP ${status} and Graph shares fallback returned HTTP ${sharesResp.status}`,
+                                directFetchBody: responseText,
+                                sharesBody: sharesText,
+                                attemptedSharesUrl: sharesUrl,
+                                suggestion: "Ensure token has Sites.Read.All or Files.Read.All and that the resource is shareable via Graph shares API. You can request additional scopes or use set-access-token.",
+                            }, null, 2) }],
+                    isError: true,
+                };
+            }
+            catch (err) {
+                logger.error("Error during Graph shares fallback", err);
+                return {
+                    content: [{ type: "text", text: JSON.stringify({ error: `Direct fetch failed HTTP ${status}`, directBody: responseText, sharesFallbackError: err instanceof Error ? err.message : String(err) }, null, 2) }],
+                    isError: true,
+                };
+            }
+        }
+        // If preferGraphFallback or direct fetch not desired, return diagnostic and hint for Graph fallback.
+        logger.info("Direct fetch skipped or not preferred; suggest Graph fallback or mapping to drive endpoint.");
+        return {
+            content: [{
+                    type: "text",
+                    text: JSON.stringify({
+                        message: "Direct fetch skipped or not preferred. Consider using Graph Drive API fallback.",
+                        note: "This tool implements direct download only. For a Graph-based fallback (mapping contentUrl to /sites/.../drive/items/.../content), enable preferGraphFallback=false and implement mapping logic.",
+                        requiredScopes: ["Sites.Read.All", "Files.Read.All"],
+                        contentUrl,
+                    }, null, 2),
+                }],
+            isError: true,
+        };
+    }
+    catch (error) {
+        logger.error("Error in download-content-url tool:", error);
+        return {
+            content: [{ type: "text", text: JSON.stringify({ error: error instanceof Error ? error.message : String(error), contentUrl }) }],
+            isError: true,
+        };
+    }
+});
 // Start the server with stdio transport
 async function main() {
     // Determine authentication mode based on environment variables
@@ -559,7 +937,13 @@ async function main() {
         certificatePassword
     };
     authManager = new AuthManager(authConfig);
-    // Only initialize if we have required config (for client token mode, we can start without a token)
+    // Start MCP transport first so the initialize handshake with the host
+    // can complete immediately, before authentication (which may require
+    // interactive browser sign-in and can take tens of seconds).
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    // Authenticate after MCP is connected. Tool handlers already guard against
+    // a null graphClient, so they return a clear error while auth is in progress.
     if (authMode !== AuthMode.ClientProvidedToken || initialAccessToken) {
         await authManager.initialize();
         // Initialize Graph Client
@@ -572,8 +956,6 @@ async function main() {
     else {
         logger.info("Started in client token mode. Use set-access-token tool to provide authentication token.");
     }
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
 }
 main().catch((error) => {
     console.error("Fatal error in main():", error);
